@@ -6,7 +6,7 @@ This competition is only for students of the ADR course at TUM. Students have to
 ## Leaderboard 🏁
 | Rank | Team | Time [s] | Success Rate [%] | Submissions |
 | :---: | :--- | :---  | :--- | :---: |
-| 🥇 | Wei Lun & Lars | 4.417 | 100 | 8 |
+| 🥇 | Wei Lun & Lars | 3.419 | 100 | 9 |
 | 🥈 | Nikola & Moritz | 4.896 | 55 | 9 |
 | 🥉 | Millennium Falcon | 5.404 | 50 | 7 |
 | 4 | Theo & Olcay | 5.606 | 50 | 9 |
