@@ -6,8 +6,9 @@ the pedagogical reference). The differences versus the example MPC are:
 1. Solver: ``SQP_RTI`` (real-time iteration) instead of full ``SQP`` so the per-cycle
    computation time is bounded (budget ~20 ms at ``config.env.freq = 50 Hz``).
 2. Reference: a track-aware :class:`TrajectoryGenerator` (built from the observed gates and
-   obstacles) replaces the hard-coded waypoints. Gate traversal and obstacle clearance are
-   handled upstream, in the trajectory, not by MPC constraints.
+   obstacles) produces the geometric waypoints, which TOPP-RA then turns into a
+   time-optimal, kinodynamically feasible trajectory for the MPC to track. Gate traversal
+   and obstacle clearance are handled upstream, in the trajectory, not by MPC constraints.
 3. Output: a Cartesian ``"state"`` command (see :meth:`compute_control`).
 
 Out of scope here: gate/obstacle MPC constraints, yaw alignment, MPCC.
@@ -19,6 +20,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import scipy
+import toppra as ta
+import toppra.algorithm as algo
+import toppra.constraint as constraint
 from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
 from drone_models.core import load_params
 from drone_models.so_rpy import symbolic_dynamics_euler
@@ -72,14 +76,17 @@ def create_ocp_solver(
 
     ocp.solver_options.N_horizon = N
 
-    # --- Cost (identical to the example MPC) ---
+    # --- Cost ---
+    # Velocity is weighted above the example MPC so the drone tracks TOPP-RA's *velocity*
+    # profile (not just its geometry) and stays closer to the time-optimal schedule. The
+    # real "fly faster" knob is the TOPP-RA v_max/a_max bounds; this weight only trims lag.
     ocp.cost.cost_type = "LINEAR_LS"
     ocp.cost.cost_type_e = "LINEAR_LS"
     Q = np.diag(
         [
             50.0, 50.0, 400.0,  # pos
             1.0, 1.0, 1.0,  # rpy
-            10.0, 10.0, 10.0,  # vel
+            20.0, 20.0, 20.0,  # vel (raised from 10 to reduce tracking lag)
             5.0, 5.0, 5.0,  # drpy
         ]
     )
@@ -142,12 +149,14 @@ class AttitudeMPCRacing(Controller):
             config: The configuration of the environment.
         """
         super().__init__(obs, info, config)
+        self._freq = config.env.freq
         self._N = 25
         self._dt = 1 / config.env.freq
         self._T_HORIZON = self._N * self._dt
 
-        # Track-aware reference from the observed gates and obstacles. Gate/obstacle
-        # avoidance is handled here (upstream), not by the MPC.
+        # Track-aware *geometric* waypoints from the observed gates and obstacles. Gate
+        # traversal and obstacle clearance are baked into these waypoints (upstream), not
+        # enforced by the MPC.
         self._traj = TrajectoryGenerator(
             start_pos=obs["pos"],
             gates_pos=np.asarray(obs["gates_pos"], dtype=float),
@@ -155,9 +164,35 @@ class AttitudeMPCRacing(Controller):
             obstacles_pos=np.asarray(obs["obstacles_pos"], dtype=float),
             freq=config.env.freq,
         )
-        self._waypoints_pos = self._traj.pos
-        self._waypoints_vel = self._traj.vel
-        self._waypoints_yaw = self._traj.yaw
+
+        # --- TOPP-RA: time-optimal parameterization of the geometric path ---
+        # Kinematic limits of the drone (per-axis velocity / acceleration bounds).
+        v_max_xy, v_max_z = 1.8, 1.0
+        vbounds = np.array(
+            [[-v_max_xy, v_max_xy], [-v_max_xy, v_max_xy], [-v_max_z, v_max_z]]
+        )
+        a_max_xy = 4.5
+        abounds = np.array([[-a_max_xy, a_max_xy], [-a_max_xy, a_max_xy], [-8.2, 4.5]])
+        pc_vel = constraint.JointVelocityConstraint(vbounds)
+        pc_acc = constraint.JointAccelerationConstraint(abounds)
+
+        # Geometric path: a spline through the gate/obstacle-aware waypoints, starting and
+        # ending at rest (clamped end conditions).
+        waypoints = self._traj.waypoints
+        gridpoints = np.linspace(0.0, 1.0, len(waypoints))
+        path = ta.SplineInterpolator(gridpoints, waypoints, bc_type="clamped")
+
+        instance = algo.TOPPRA(
+            [pc_vel, pc_acc], path, parametrizer="ParametrizeConstAccel"
+        )
+        self._trajectory = instance.compute_trajectory()
+        if self._trajectory is None:
+            raise RuntimeError(
+                "TOPP-RA failed to compute a valid trajectory. Check your waypoints and "
+                "constraints."
+            )
+        self._t_total = self._trajectory.duration
+        print(f"Computed TOPP-RA trajectory with optimal duration: {self._t_total:.2f} s")
 
         self.drone_params = load_params("so_rpy", config.sim.drone_model)
         self._acados_ocp_solver, self._ocp = create_ocp_solver(
@@ -169,7 +204,8 @@ class AttitudeMPCRacing(Controller):
         self._ny_e = self._nx
 
         self._tick = 0
-        self._tick_max = len(self._waypoints_pos) - 1 - self._N
+        # Tick at which the trajectory is exhausted; afterwards we hold the final state.
+        self._tick_max = int(np.ceil(self._t_total * self._freq))
         self._config = config
         self._finished = False
 
@@ -182,7 +218,6 @@ class AttitudeMPCRacing(Controller):
         ``control_mode = "state"`` command expected by the environment:
         ``[x, y, z, vx, vy, vz, ax, ay, az, yaw, rrate, prate, yrate]``.
         """
-        i = min(self._tick, self._tick_max)
         if self._tick >= self._tick_max:
             self._finished = True
 
@@ -193,19 +228,29 @@ class AttitudeMPCRacing(Controller):
         self._acados_ocp_solver.set(0, "lbx", x0)
         self._acados_ocp_solver.set(0, "ubx", x0)
 
-        # State / input references.
+        # Sample the TOPP-RA trajectory over the prediction horizon. Times past the end of
+        # the trajectory are clamped, so the reference holds the final (resting) state.
+        t0 = self._tick * self._dt
+        t_ref = np.clip(t0 + np.arange(self._N + 1) * self._dt, 0.0, self._t_total)
+        pos_ref = self._trajectory(t_ref, 0)  # (N+1, 3) positions
+        vel_ref = self._trajectory(t_ref, 1)  # (N+1, 3) velocities
+
+        # State / input references (yaw reference stays zero). The thrust reference is hover:
+        # the input-thrust weight (R = 50) is strong, so a thrust feed-forward that is not
+        # backed by a matching attitude feed-forward fights the dynamics and dives the drone
+        # into the ground. The MPC recovers the thrust it actually needs from the model over
+        # the horizon; speed comes from the position/velocity tracking and the TOPP-RA bounds.
+        hover_thrust = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
         yref = np.zeros((self._N, self._ny))
-        yref[:, 0:3] = self._waypoints_pos[i : i + self._N]  # position
-        yref[:, 5] = self._waypoints_yaw[i : i + self._N]  # yaw (zero)
-        yref[:, 6:9] = self._waypoints_vel[i : i + self._N]  # velocity
-        yref[:, 15] = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
+        yref[:, 0:3] = pos_ref[: self._N]  # position
+        yref[:, 6:9] = vel_ref[: self._N]  # velocity
+        yref[:, 15] = hover_thrust  # collective-thrust feed-forward (hover)
         for j in range(self._N):
             self._acados_ocp_solver.set(j, "yref", yref[j])
 
         yref_e = np.zeros((self._ny_e))
-        yref_e[0:3] = self._waypoints_pos[i + self._N]
-        yref_e[5] = self._waypoints_yaw[i + self._N]
-        yref_e[6:9] = self._waypoints_vel[i + self._N]
+        yref_e[0:3] = pos_ref[self._N]
+        yref_e[6:9] = vel_ref[self._N]
         self._acados_ocp_solver.set(self._N, "yref", yref_e)
 
         self._acados_ocp_solver.solve()
