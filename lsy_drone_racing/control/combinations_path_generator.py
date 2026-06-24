@@ -110,8 +110,7 @@ def generate_combination_splines(
         ss = np.linspace(0.0, 1.0, len(waypoints))  # normalized arc parameter
         path = ta.SplineInterpolator(ss, waypoints, bc_type=bc_type)
         paths.append(path)
-        spline_coeffs.append(spline_coefficients(path))
-    return spline_coeffs, paths, combos
+    return paths, combos
 
 
 if __name__ == "__main__":
@@ -121,9 +120,9 @@ if __name__ == "__main__":
     grpy = np.array([[0, 0, -0.78], [0, 0, 2.35], [0, 0, 3.14], [0, 0, 0.0]])
     gquat = R.from_euler("xyz", grpy).as_quat()
 
-    coeffs, paths, combos = generate_combination_splines(start, gpos, gquat)
+    paths, combos = generate_combination_splines(start, gpos, gquat)
     n = len(gpos)
     print(f"n_gates = {n}")
     print(f"combinations = n! * 2^n = {math.factorial(n)} * {2 ** n} = {len(combos)}")
-    print(f"toppra splines built = {len(paths)} | coeff sets = {len(coeffs)}")
-    print(f"one coeff array shape = {coeffs[0].shape}  (4 cubic coeffs, n_segments, 3 axes)")
+    print(f"toppra splines built = {len(paths)}")
+    print(f"one coeff array shape = {spline_coefficients(paths[0]).shape}  (4 cubic coeffs, n_segments, 3 axes)")
