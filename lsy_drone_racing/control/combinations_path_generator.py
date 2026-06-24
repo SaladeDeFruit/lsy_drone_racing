@@ -1,4 +1,4 @@
-"""Generate every candidate path (gate order x gate face) and extract its spline coefficients.
+"""Generate every candidate path (gate order x gate face) with toppra's spline tool.
 
 4 gates, each with 2 faces (front / back). A combination is an ORDER of the gates (each used
 at most once) together with a FACE choice per gate. The number of distinct combinations is:
@@ -6,8 +6,9 @@ at most once) together with a FACE choice per gate. The number of distinct combi
     N = n_gates! * 2**n_gates      # for 4 gates: 4! * 2**4 = 24 * 16 = 384
 
 For each combination we build the waypoints (start, then per-gate approach/center/exit aligned
-on the gate normal), fit a cubic spline, and store its coefficients. All spline coefficients
-are concatenated into one list.
+on the gate normal), fit a ``toppra.SplineInterpolator`` (the same spline tool used downstream
+by TOPP-RA), and collect its coefficients. The spline is purely GEOMETRIC: parameterized by a
+normalized arc ``s in [0, 1]``, not time. Time/velocity comes later from TOPP-RA.
 
 The geometry (gates) is the only input: pass gate positions + orientations (from
 ``obs["gates_pos"]`` / ``obs["gates_quat"]``).
@@ -17,8 +18,7 @@ import math
 from itertools import permutations, product
 
 import numpy as np
-
-from scipy.interpolate import CubicSpline
+import toppra as ta
 from scipy.spatial.transform import Rotation as R
 
 
@@ -54,12 +54,8 @@ def gate_face_waypoints(center, normal, face, approach_dist):
 def generate_combinations(n_gates):
     """All (order, faces) combinations: every gate ordering x every per-gate face choice.
 
-    Args:
-        n_gates: number of gates.
-
     Returns:
-        list of (order, faces) tuples. ``order`` is a permutation of gate indices, ``faces``
-        a tuple of 0/1 per gate (in traversal order). Length = n_gates! * 2**n_gates.
+        list of (order, faces) tuples. Length = n_gates! * 2**n_gates.
     """
     combos = []
     for order in permutations(range(n_gates)):
@@ -76,33 +72,46 @@ def build_waypoints(start_pos, gates_pos, normals, order, faces, approach_dist):
     return np.array(waypoints)
 
 
-def generate_combination_splines(start_pos, gates_pos, gates_quat, approach_dist=0.3):
-    """Build a cubic spline per combination and collect every spline's coefficients.
+def spline_coefficients(path):
+    """Extract the cubic-polynomial coefficients from a toppra SplineInterpolator.
+
+    toppra wraps a ``scipy.interpolate.CubicSpline`` in ``path.cspl``; its ``.c`` array has
+    shape ``(4, n_segments, 3)`` = (cubic coeffs, segments, xyz axes).
+    """
+    return np.asarray(path.cspl.c)
+
+
+def generate_combination_splines(
+    start_pos, gates_pos, gates_quat, approach_dist=0.3, bc_type="clamped"
+):
+    """Build a toppra spline per combination and collect every spline's coefficients.
 
     Args:
         start_pos: (3,) drone start position (``obs["pos"]``).
         gates_pos: (n_gates, 3) gate centers (``obs["gates_pos"]``).
         gates_quat: (n_gates, 4) xyzw gate orientations (``obs["gates_quat"]``).
         approach_dist: approach/exit offset along the gate normal, in meters.
+        bc_type: boundary condition for the spline ("clamped" -> start/end at rest).
 
     Returns:
-        spline_coeffs: list of coefficient arrays, one per combination. Each has shape
-            ``(4, n_segments, 3)`` (cubic poly coeffs per segment per axis), as returned by
-            ``scipy.interpolate.CubicSpline.c``.
-        combos: the matching list of (order, faces) so each coeff set is identifiable.
+        spline_coeffs: list of coefficient arrays, one per combination, each of shape
+            ``(4, n_segments, 3)``.
+        paths: list of ``toppra.SplineInterpolator`` (ready to feed to TOPP-RA).
+        combos: matching list of (order, faces) so each candidate is identifiable.
     """
     gates_pos = np.asarray(gates_pos, dtype=float)
     normals = gate_normals(gates_quat)
     n_gates = len(gates_pos)
 
     combos = generate_combinations(n_gates)
-    spline_coeffs = []
+    spline_coeffs, paths = [], []
     for order, faces in combos:
         waypoints = build_waypoints(start_pos, gates_pos, normals, order, faces, approach_dist)
         ss = np.linspace(0.0, 1.0, len(waypoints))  # normalized arc parameter
-        spline = CubicSpline(ss, waypoints, axis=0)
-        spline_coeffs.append(spline.c)  # (4, n_segments, 3)
-    return spline_coeffs, combos
+        path = ta.SplineInterpolator(ss, waypoints, bc_type=bc_type)
+        paths.append(path)
+        spline_coeffs.append(spline_coefficients(path))
+    return spline_coeffs, paths, combos
 
 
 if __name__ == "__main__":
@@ -112,8 +121,9 @@ if __name__ == "__main__":
     grpy = np.array([[0, 0, -0.78], [0, 0, 2.35], [0, 0, 3.14], [0, 0, 0.0]])
     gquat = R.from_euler("xyz", grpy).as_quat()
 
-    coeffs, combos = generate_combination_splines(start, gpos, gquat)
-    print(f"n_gates = {len(gpos)}")
-    print(f"combinations = n! * 2^n = {math.factorial(len(gpos))} * {2**len(gpos)} = {len(combos)}")
-    print(f"splines (coeff sets) collected = {len(coeffs)}")
+    coeffs, paths, combos = generate_combination_splines(start, gpos, gquat)
+    n = len(gpos)
+    print(f"n_gates = {n}")
+    print(f"combinations = n! * 2^n = {math.factorial(n)} * {2 ** n} = {len(combos)}")
+    print(f"toppra splines built = {len(paths)} | coeff sets = {len(coeffs)}")
     print(f"one coeff array shape = {coeffs[0].shape}  (4 cubic coeffs, n_segments, 3 axes)")
