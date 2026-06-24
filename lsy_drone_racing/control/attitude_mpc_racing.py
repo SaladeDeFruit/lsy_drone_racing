@@ -83,12 +83,12 @@ def create_ocp_solver(
     ocp.cost.cost_type = "LINEAR_LS"
     ocp.cost.cost_type_e = "LINEAR_LS"
     Q = np.diag(
-        [
-            50.0, 50.0, 400.0,  # pos
-            1.0, 1.0, 1.0,  # rpy
-            20.0, 20.0, 20.0,  # vel (raised from 10 to reduce tracking lag)
-            5.0, 5.0, 5.0,  # drpy
-        ]
+    [
+        50.0, 50.0, 400.0,   # pos
+        1.0, 1.0, 0.0,       # roll, pitch, yaw -> yaw libre (poids 0)
+        10.0, 10.0, 10.0,    # vel
+        5.0, 5.0, 2.0,       # drpy (rrate, prate, yrate)
+    ]
     )
     R_in = np.diag([1.0, 1.0, 1.0, 50.0])  # rpy commands + thrust
     Q_e = Q.copy()
