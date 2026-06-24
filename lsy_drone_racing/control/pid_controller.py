@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os    # <-- NOUVEAU IMPORT POUR LE CHEMIN DU FICHIER
+import time  # <-- IMPORT AJOUTÉ POUR LE CHRONOMÈTRE
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -25,7 +27,6 @@ class StateController(Controller):
 
         # Suppress verbose TOPP-RA logging (optional)
         ta.setup_logging("WARNING")
-
         start_pos = obs["pos"]
         waypoints = np.array(
             [
@@ -43,28 +44,23 @@ class StateController(Controller):
         )
 
         # 1. Create a geometric path from the waypoints
-        # The path parameter 's' ranges from 0 to 1
         ss = np.linspace(0, 1, len(waypoints))
         path = ta.SplineInterpolator(ss, waypoints)
 
         # 2. Define kinematic constraints for the drone
-        # You will need to tune these values based on your drone's physical limits
-        v_max_xy = 3.5 
-        v_max_z = 2.0
+        v_max_xy = 1.8
+        v_max_z = 1.0
         vbounds = np.array([
-            [-v_max_xy, v_max_xy], # X
-            [-v_max_xy, v_max_xy], # Y
-            [-v_max_z, v_max_z]    # Z
+            [-v_max_xy, v_max_xy],
+            [-v_max_xy, v_max_xy],
+            [-v_max_z, v_max_z]
         ])
         
-        # Realistic Racing Acceleration Limits (m/s^2)
-        # X, Y: Capped around 6 m/s^2 to limit extreme pitching
-        # Z: Asymmetrical (-5 downward, +7 upward)
-        a_max_xy = 6.0 
+        a_max_xy = 4.5 
         abounds = np.array([
-            [-a_max_xy, a_max_xy], # X
-            [-a_max_xy, a_max_xy], # Y
-            [-5.0, 7.0]            # Z (Negative is down, Positive is up)
+            [-a_max_xy, a_max_xy],
+            [-a_max_xy, a_max_xy],
+            [-8.2, 4.5]
         ])
         
         pc_vel = constraint.JointVelocityConstraint(vbounds)
@@ -77,31 +73,54 @@ class StateController(Controller):
         if self._trajectory is None:
             raise RuntimeError("TOPP-RA failed to compute a valid trajectory. Check your waypoints and constraints.")
 
-        # Total duration is dynamically computed by TOPP-RA
         self._t_total = self._trajectory.duration
-        print(self._t_total)
         print(f"Computed TOPP-RA trajectory with optimal duration: {self._t_total:.2f} s")
 
         self._tick = 0
         self._finished = False
+        
+        # --- VARIABLES POUR LE TEMPS RÉEL ---
+        self._real_start_time = None
+        self._time_logged = False
+        
+        # --- NOUVEAU : PRÉPARATION DU FICHIER ET PREMIÈRE ÉCRITURE ---
+        # On définit le chemin absolu vers le dossier actuel
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        self._log_file = os.path.join(current_dir, "temps_reel_trajet.txt")
+        
+        # On écrit la première partie de la ligne (SANS retour à la ligne '\n')
+        with open(self._log_file, "a", encoding="utf-8") as f:
+            f.write(f"Temps simulé: {self._t_total:.4f} s | Temps réel: ")
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
         """Compute the next desired state of the drone."""
-        t = min(self._tick / self._freq, self._t_total)
-        if t >= self._t_total:  # Maximum duration reached
-            self._finished = True
+        
+        # --- DÉMARRER LE CHRONO AU PREMIER MOUVEMENT ---
+        if self._real_start_time is None:
+            self._real_start_time = time.perf_counter()
 
-        # Evaluate the TOPP-RA trajectory at the current time t
-        # order=0 -> Position, order=1 -> Velocity, order=2 -> Acceleration
+        t = min(self._tick / self._freq, self._t_total)
+        
+        # --- VÉRIFIER LA FIN ET COMPLÉTER LE FICHIER ---
+        if t >= self._t_total and not self._finished: 
+            self._finished = True
+            
+            if not self._time_logged:
+                # Calcul de la durée d'exécution réelle
+                real_duration = time.perf_counter() - self._real_start_time
+                
+                # On complète la ligne existante et on ajoute le retour à la ligne (\n) à la fin
+                with open(self._log_file, "a", encoding="utf-8") as f:
+                    f.write(f"{real_duration:.4f} s\n")
+                
+                self._time_logged = True
+
         des_pos = self._trajectory(t, 0)
         des_vel = self._trajectory(t, 1)
         des_acc = self._trajectory(t, 2)
 
-        # The drone state array requires 13 elements:
-        # [x, y, z, vx, vy, vz, ax, ay, az, yaw, rrate, prate, yrate]
-        # We now pass the dynamically feasible velocity and acceleration as well!
         yaw_and_rates = np.zeros(4) 
         action = np.concatenate((des_pos, des_vel, des_acc, yaw_and_rates), dtype=np.float32)
         
@@ -122,17 +141,27 @@ class StateController(Controller):
 
     def episode_callback(self):
         """Reset the internal state."""
+        # --- SÉCURITÉ : Si l'épisode précédent a été coupé avant d'atteindre la fin ---
+        if self._real_start_time is not None and not self._time_logged:
+             with open(self._log_file, "a", encoding="utf-8") as f:
+                 f.write("Inachevé (Crash ou Reset)\n")
+
         self._tick = 0
+        self._real_start_time = None
+        self._time_logged = False
+        self._finished = False
+
+        # --- NOUVEAU : On réécrit le début de la ligne pour le nouvel épisode ---
+        with open(self._log_file, "a", encoding="utf-8") as f:
+            f.write(f"Temps simulé: {self._t_total:.4f} s | Temps réel: ")
 
     def render_callback(self, sim: Sim):
         """Visualize the desired trajectory and the current setpoint."""
         current_time = min(self._tick / self._freq, self._t_total)
         
-        # Current Setpoint
         setpoint = self._trajectory(current_time, 0).reshape(1, -1)
         draw_points(sim, setpoint, rgba=(1.0, 0.0, 0.0, 1.0), size=0.02)
         
-        # Render the full optimal trajectory
         t_samples = np.linspace(0, self._t_total, 100)
         trajectory_points = np.array([self._trajectory(t, 0) for t in t_samples])
         draw_line(sim, trajectory_points, rgba=(0.0, 1.0, 0.0, 1.0))
