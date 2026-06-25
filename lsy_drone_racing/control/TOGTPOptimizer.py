@@ -5,13 +5,15 @@ import matplotlib.pyplot as plt
 
 class QuadrotorModel:
     def __init__(self):
-        self.mass = 0.85
-        self.arm_length = 0.15
-        self.inertia = np.array([1.0, 1.0, 1.7]) * 1e-3
-        self.f_max = 6.88
-        self.c_tau = 0.05
-        self.omega_max = np.array([15.0, 15.0, 3.0])
+        # cf2x_P250 (the only two used by the current cost are mass and f_max).
+        self.mass = 0.0318                                    # kg
+        self.f_max = 0.12                                     # N per motor (thrust_max)
         self.gravity = np.array([0, 0, -9.81])
+        # Set for correctness / future use (not used by the current cost function):
+        self.arm_length = 0.046                               # m (cf2x approx)
+        self.inertia = np.array([16.8e-6, 16.8e-6, 29.8e-6])  # kg m^2 (J diag)
+        self.c_tau = 0.0069928948992470565                    # thrust2torque
+        self.omega_max = np.array([15.0, 15.0, 3.0])          # rad/s (kept; tune if needed)
 
 class PolygonGate:
     def __init__(self, id, vertices):

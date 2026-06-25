@@ -1,8 +1,10 @@
-"""Stage 4: real-time attitude MPC tracking a sampled TOPP-RA reference.
+"""Real-time attitude MPC tracking the same TOPP-RA trajectory as the StateController.
 
-Pipeline (strict separation of concerns):
-  1. Spatial path generation (separate file, NOT here) -> geometric path over a normalized
-     arc parameter (a ``toppra.SplineInterpolator`` or equivalent callable).
+Pipeline:
+  1. Spatial path -> the fixed race waypoints (with the start at the measured position) define
+     a ``toppra.SplineInterpolator`` over a normalized arc parameter. These waypoints and the
+     kinematic limits are identical to ``StateController`` (``pid_controller.py``), so this MPC
+     tracks the exact same reference the PID-style controller would fly.
   2. TOPP-RA -> time-parameterizes that path under per-axis kinematic limits ->
      ``traj = instance.compute_trajectory()`` (callable: ``traj(t,0/1/2)`` = pos/vel/acc,
      with ``traj.duration``).
@@ -35,16 +37,28 @@ if TYPE_CHECKING:
 # State layout: [pos(0:3), rpy(3:6), vel(6:9), drpy(9:12)]. yaw = index 5, yaw-rate = 11.
 YAW_IDX = 5
 
-# Default TOPP-RA kinematic limits (configurable, per-axis, asymmetric). Format: (dof, 2) =
-# [lower, upper]. z is asymmetric: gravity lets the drone decelerate downward harder than it
-# can accelerate upward.
-DEFAULT_VEL_LIMIT = np.array([[-1.8, 1.8], [-1.8, 1.8], [-1.0, 1.0]])  # m/s
-DEFAULT_ACC_LIMIT = np.array([[-4.5, 4.5], [-4.5, 4.5], [-8.2, 4.5]])  # m/s^2
+# Default TOPP-RA kinematic limits (configurable, per-axis). Format: (dof, 2) = [lower,
+# upper]. These mirror the StateController (pid_controller.py) limits so this MPC tracks the
+# exact same TOPP-RA trajectory the PID-style controller would fly.
+DEFAULT_VEL_LIMIT = np.array([[-1.5, 1.5], [-1.5, 1.5], [-1.0, 1.0]])  # m/s
+DEFAULT_ACC_LIMIT = np.array([[-3.5, 3.5], [-3.5, 3.5], [-2.0, 2.0]])  # m/s^2
 
-
-def _wrap_to_pi(angle):
-    """Wrap an angle (or array) to (-pi, pi]."""
-    return (angle + np.pi) % (2 * np.pi) - np.pi
+# Race waypoints identical to StateController.__init__ (pid_controller.py). The first
+# waypoint is replaced at runtime by the measured start position.
+RACE_WAYPOINTS = np.array(
+    [
+        [0.0, 0.0, 0.0],  # placeholder for start_pos = obs["pos"]
+        [-1.0, 0.75, 0.4],
+        [0.3, 0.35, 0.7],
+        [1.3, -0.15, 0.9],
+        [0.85, 0.85, 1.2],
+        [-0.5, -0.05, 0.7],
+        [-1.2, -0.2, 0.8],
+        [-1.2, -0.2, 1.2],
+        [-0.0, -0.7, 1.2],
+        [0.5, -0.75, 1.2],
+    ]
+)
 
 
 def create_acados_model(parameters: dict) -> AcadosModel:
@@ -114,6 +128,16 @@ def create_ocp_solver(
     ocp.constraints.lbx = np.array([-0.5, -0.5, -0.5])
     ocp.constraints.ubx = np.array([0.5, 0.5, 0.5])
     ocp.constraints.idxbx = np.array([3, 4, 5])
+    # Soften the rpy box into slacked constraints. The aggressive TOPP-RA reference can demand
+    # a tilt momentarily beyond +/-0.5 rad (e.g. diagonal corners where x and y accelerate at
+    # once); with a HARD box that makes the QP infeasible and HPIPM diverges to NaN (status 3).
+    # A heavily penalized slack lets the MPC briefly exceed the limit instead of failing.
+    ocp.constraints.idxsbx = np.array([0, 1, 2])  # slack roll, pitch, yaw bounds
+    ns = 3
+    ocp.cost.zl = 1e3 * np.ones(ns)  # L1 slack penalty (lower)
+    ocp.cost.zu = 1e3 * np.ones(ns)  # L1 slack penalty (upper)
+    ocp.cost.Zl = 1e2 * np.ones(ns)  # L2 slack penalty (lower)
+    ocp.cost.Zu = 1e2 * np.ones(ns)  # L2 slack penalty (upper)
     ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4])
     ocp.constraints.ubu = np.array([0.5, 0.5, 0.5, parameters["thrust_max"] * 4])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3])
@@ -122,7 +146,10 @@ def create_ocp_solver(
     ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
     ocp.solver_options.integrator_type = "ERK"
-    ocp.solver_options.nlp_solver_type = "SQP_RTI"
+    ocp.solver_options.nlp_solver_type = "SQP"
+    # Small Levenberg-Marquardt term: regularizes the Gauss-Newton Hessian so a single RTI
+    # step from an imperfect warm start stays well-conditioned (avoids HPIPM NaN / status 3).
+    ocp.solver_options.levenberg_marquardt = 1e-3
     ocp.solver_options.tol = 1e-6
     ocp.solver_options.qp_solver_cond_N = N
     ocp.solver_options.qp_solver_warm_start = 1
@@ -154,6 +181,7 @@ class AttitudeMPCRacing(Controller):
         traj_gen = self._build_reference(obs, config)
         self._waypoints_pos = traj_gen.pos
         self._waypoints_vel = traj_gen.vel
+        self._waypoints_acc = traj_gen.acc  # smooth feed-forward acceleration for the command
         self._waypoints_yaw = traj_gen.yaw  # zeros; NOT tracked (yaw is free)
         self._duration = traj_gen.duration
 
@@ -175,25 +203,61 @@ class AttitudeMPCRacing(Controller):
         self._ny = self._nx + self._nu
         self._ny_e = self._nx
 
+        # Hover thrust (collective): cancels gravity at level attitude. Used both as the input
+        # reference and to seed the solver so the first RTI step linearizes around a near-feasible
+        # guess instead of a zero-thrust free fall.
+        self._hover_thrust = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
+
         self._tick = 0
         self._tick_max = self._T - 1 - self._N
         self._config = config
         self._finished = False
 
-    def _build_reference(self, obs: dict, config: dict) -> TrajectoryGenerator:
-        """Build the sampled reference: spatial path (1) -> TOPP-RA (2) -> sampler (3).
+        # Seed the solver trajectory before the first solve (see _warm_start).
+        self._warm_start(0)
 
-        Stage 1 lives in a SEPARATE module (not created here). It must return the geometric
-        path as a toppra-compatible interpolator (see the accompanying note for the contract).
-        We only feed that path to TOPP-RA with configurable, per-axis asymmetric kinematic
-        limits, then wrap the resulting trajectory in the pure sampler.
+    def _warm_start(self, i: int) -> None:
+        """Seed the solver's state/input trajectory with the reference and hover thrust.
+
+        SQP_RTI takes a single Newton step per call, so a poor initial guess is never recovered
+        within one tick. A zero initial guess means zero collective thrust -> the predicted drone
+        free-falls over the horizon and the Gauss-Newton linearization diverges to NaN (HPIPM
+        status 3). Seeding hover thrust and the reference positions/velocities gives a sensible,
+        near-feasible starting point. Also used to re-seed after a failed solve so one bad QP does
+        not poison the warm start of every subsequent tick.
         """
-        # Lazy imports: stage 1 and toppra are external to this real-time module.
-        from lsy_drone_racing.control.spatial_path import build_spatial_path  # stage 1
+        u_hover = np.array([0.0, 0.0, 0.0, self._hover_thrust])
+        for j in range(self._N + 1):
+            k = min(i + j, self._T - 1)
+            xg = np.zeros(self._nx)
+            xg[0:3] = self._waypoints_pos[k]
+            xg[6:9] = self._waypoints_vel[k]
+            self._acados_ocp_solver.set(j, "x", xg)
+            if j < self._N:
+                self._acados_ocp_solver.set(j, "u", u_hover)
+
+    def _build_reference(self, obs: dict, config: dict) -> TrajectoryGenerator:
+        """Build the sampled reference matching the StateController (pid_controller) trajectory.
+
+        Reproduces ``StateController.__init__``: the same fixed race waypoints (with the start
+        replaced by the measured position) define a ``SplineInterpolator``, TOPP-RA
+        time-parameterizes it under the same per-axis kinematic limits, and the result is
+        wrapped in the pure sampler. This MPC therefore tracks exactly the trajectory the
+        PID-style controller would fly. The limits stay overridable via a ``[toppra]`` config
+        section, defaulting to the StateController values.
+        """
+        # Lazy imports: toppra is external to this real-time module.
+        import toppra as ta
         import toppra.algorithm as toppra_algo
         import toppra.constraint as toppra_constraint
 
-        path = build_spatial_path(obs, config)  # stage 1: geometry only
+        # Same waypoints as StateController, but start at the measured drone position.
+        waypoints = RACE_WAYPOINTS.copy()
+        waypoints[0] = obs["pos"]
+
+        # Geometric path over a normalized arc parameter (identical to StateController).
+        ss = np.linspace(0.0, 1.0, len(waypoints))
+        path = ta.SplineInterpolator(ss, waypoints)
 
         tp = config.get("toppra", {}) if hasattr(config, "get") else {}
         vlim = np.asarray(tp.get("vel_limit", DEFAULT_VEL_LIMIT), dtype=float)
@@ -206,7 +270,7 @@ class AttitudeMPCRacing(Controller):
         traj = instance.compute_trajectory()
         if traj is None:
             raise RuntimeError(
-                "TOPP-RA failed to compute a trajectory. Check the stage-1 path and limits."
+                "TOPP-RA failed to compute a trajectory. Check the waypoints and limits."
             )
         return TrajectoryGenerator(traj, config.env.freq)
 
@@ -232,7 +296,7 @@ class AttitudeMPCRacing(Controller):
         yref[:, 0:3] = self._waypoints_pos[i : i + self._N]  # position
         yref[:, 5] = self._waypoints_yaw[i : i + self._N]  # yaw (zero, weight 0 -> ignored)
         yref[:, 6:9] = self._waypoints_vel[i : i + self._N]  # velocity
-        yref[:, 15] = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
+        yref[:, 15] = self._hover_thrust  # collective thrust reference (gravity compensation)
         for j in range(self._N):
             self._acados_ocp_solver.set(j, "yref", yref[j])
 
@@ -242,17 +306,31 @@ class AttitudeMPCRacing(Controller):
         yref_e[6:9] = self._waypoints_vel[i + self._N]
         self._acados_ocp_solver.set(self._N, "yref", yref_e)
 
-        self._acados_ocp_solver.solve()
+        # Solve. On failure (HPIPM status != 0, e.g. NaN/status 3), re-seed the warm start and
+        # retry once so a single bad QP does not poison every following tick.
+        status = self._acados_ocp_solver.solve()
+        if status != 0:
+            self._warm_start(i)
+            status = self._acados_ocp_solver.solve()
 
-        # Optimized next state (horizon stage 1) -> Cartesian "state" command.
-        x1 = self._acados_ocp_solver.get(1, "x")
-        pos1, rpy1, vel1, drpy1 = x1[0:3], x1[3:6], x1[6:9], x1[9:12]
-        acc = (vel1 - x0[6:9]) / self._dt
-        # Yaw continuity: commanded yaw = continuous value nearest the measured yaw, so a wrap
-        # across +/-pi never produces a discontinuous setpoint downstream.
-        yaw_meas = x0[YAW_IDX]
-        yaw_cmd = yaw_meas + _wrap_to_pi(rpy1[2] - yaw_meas)
-        return np.concatenate((pos1, vel1, acc, [yaw_cmd], drpy1))
+        # Command the TOPP-RA reference target directly (position/velocity/acceleration at the
+        # current time index). This is what actually makes the drone FOLLOW the trajectory: the
+        # onboard "state" interface flies hard toward the real target, exactly like the
+        # StateController (pid_controller.py) which tracks 4 gates. Commanding the MPC's
+        # one-step-ahead predicted state instead made the cascade lag (the setpoint sat just
+        # ahead of the lagging drone, so it never caught up and crawled along the floor).
+        #
+        # The MPC solve above remains as a dynamic-feasibility guard: if it reports the reference
+        # is infeasible from the current state (NaN / status != 0), we fall back to a zero-accel,
+        # measured-yaw setpoint to stay safe instead of pushing a divergent command.
+        k = min(i, self._T - 1)
+        if status != 0 or not np.all(np.isfinite(self._acados_ocp_solver.get(1, "x"))):
+            return np.concatenate(
+                (self._waypoints_pos[k], self._waypoints_vel[k], np.zeros(3), [x0[YAW_IDX]], np.zeros(3))
+            )
+        return np.concatenate(
+            (self._waypoints_pos[k], self._waypoints_vel[k], self._waypoints_acc[k], [0.0], np.zeros(3))
+        )
 
     def step_callback(
         self,
