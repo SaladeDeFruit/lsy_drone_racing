@@ -30,6 +30,8 @@ DEFAULT_V_MAX_Z = 1.0  # m/s
 DEFAULT_A_MAX_XY = 3.5  # m/s^2
 DEFAULT_A_MAX_Z = 2.0  # m/s^2
 
+GATE_OPENING = 0.4  # m, square gate opening (inner frame), see config/level0.toml
+
 
 def gate_normals(gates_quat):
     """Gate normals (crossing direction) = gate-frame x-axis expressed in world.
@@ -268,6 +270,134 @@ def optimal_waypoints(
     )
 
 
+# =====================================================================================
+# Bridge to the TOTG optimizer (TOGTPOptimizer.DroneRacingOptimizer).
+#
+# combinations_path_generator finds the fastest GATE ORDER; the optimizer then refines the
+# exact crossing point inside each gate and the segment times. The optimizer needs the gates
+# as POLYGONS (4 vertices) and a properly configured drone model.
+# =====================================================================================
+
+
+def gate_polygon(center, quat, opening=GATE_OPENING):
+    """The 4 corner vertices of a gate opening (square ``opening`` x ``opening``).
+
+    The square lies in the plane perpendicular to the gate normal (the gate-frame y/z axes),
+    centered on the gate center. This is what ``TOGTPOptimizer.PolygonGate`` expects.
+
+    Args:
+        center: (3,) gate center (``gates_pos[g]``).
+        quat: (4,) xyzw gate orientation (``gates_quat[g]``).
+        opening: side length of the square opening, in meters.
+
+    Returns:
+        list of four (3,) corner positions.
+    """
+    rot = R.from_quat(quat)
+    y = rot.apply([0.0, 1.0, 0.0])  # gate width axis (world)
+    z = rot.apply([0.0, 0.0, 1.0])  # gate height axis (world)
+    h = 0.5 * opening
+    c = np.asarray(center, dtype=float)
+    return [c + h * y + h * z, c + h * y - h * z, c - h * y - h * z, c - h * y + h * z]
+
+
+def cf2x_p250_model():
+    """A ``QuadrotorModel`` configured for the cf2x_P250.
+
+    The optimizer's default ``QuadrotorModel`` is a large generic quad (mass 0.85 kg,
+    f_max 6.88 N) — wrong for our drone, which would make the thrust constraint meaningless.
+    Only mass / gravity / f_max enter the current cost; the rest is set for completeness.
+    """
+    from lsy_drone_racing.control.TOGTPOptimizer import QuadrotorModel
+
+    model = QuadrotorModel()
+    model.mass = 0.0318  # kg
+    model.f_max = 0.12  # N per motor (thrust_max)
+    model.gravity = np.array([0.0, 0.0, -9.81])
+    model.arm_length = 0.046  # m (cf2x approx)
+    model.inertia = np.array([16.8e-6, 16.8e-6, 29.8e-6])  # kg m^2
+    return model
+
+
+def build_optimizer(
+    start_pos,
+    gates_pos,
+    gates_quat,
+    drone_model=None,
+    end_pos=None,
+    opening=GATE_OPENING,
+    exit_dist=0.5,
+    approach_dist=0.05,
+    v_max_xy=DEFAULT_V_MAX_XY,
+    v_max_z=DEFAULT_V_MAX_Z,
+    a_max_xy=DEFAULT_A_MAX_XY,
+    a_max_z=DEFAULT_A_MAX_Z,
+):
+    """Rank the combinations, then build a ready-to-solve ``DroneRacingOptimizer``.
+
+    Sends the optimizer everything it needs: the drone model (cf2x_P250 by default) and the
+    gates as ``PolygonGate`` in the time-optimal order, plus the start/end positions.
+
+    Args:
+        start_pos: (3,) drone start (``obs["pos"]``).
+        gates_pos: (n_gates, 3) gate centers (``obs["gates_pos"]``).
+        gates_quat: (n_gates, 4) xyzw gate orientations (``obs["gates_quat"]``).
+        drone_model: a ``QuadrotorModel``; defaults to :func:`cf2x_p250_model`.
+        end_pos: (3,) final position; defaults to a point ``exit_dist`` past the last gate,
+            along its exit direction (from the chosen face).
+        opening: gate opening side length (m), for the polygon vertices.
+        exit_dist: how far past the last gate the default end point sits (m).
+        approach_dist, v_max_*, a_max_*: passed to the combination ranking (TOPP-RA timing).
+
+    Returns:
+        (optimizer, best_order, best_duration):
+            optimizer: a ``DroneRacingOptimizer`` ready for ``.solve()``.
+            best_order: tuple of gate indices in the chosen traversal order.
+            best_duration: TOPP-RA traversal time (s) of that order (the ranking estimate).
+    """
+    from lsy_drone_racing.control.TOGTPOptimizer import DroneRacingOptimizer, PolygonGate
+
+    gates_pos = np.asarray(gates_pos, dtype=float)
+
+    # 1. Fastest gate order (and faces) from the TOPP-RA combination ranking.
+    ranked = rank_combinations_by_duration(
+        start_pos, gates_pos, gates_quat, approach_dist, "clamped",
+        v_max_xy, v_max_z, a_max_xy, a_max_z,
+    )
+    best_order, best_faces, best_duration = ranked[0]
+
+    # 2. The needed gates, as PolygonGate, IN THE OPTIMAL ORDER.
+    gates = [
+        PolygonGate(seq, gate_polygon(gates_pos[g], gates_quat[g], opening))
+        for seq, g in enumerate(best_order)
+    ]
+
+    # 3. The drone model (cf2x_P250 by default).
+    model = drone_model if drone_model is not None else cf2x_p250_model()
+
+    # 4. Start / end positions. Default end = past the last gate, in its exit direction.
+    if end_pos is None:
+        normals = gate_normals(gates_quat)
+        last, last_face = best_order[-1], best_faces[-1]
+        exit_dir = normals[last] if last_face == 0 else -normals[last]
+        end_pos = gates_pos[last] + exit_dist * exit_dir
+
+    optimizer = DroneRacingOptimizer(
+        model, gates, np.asarray(start_pos, dtype=float), np.asarray(end_pos, dtype=float)
+    )
+    return optimizer, best_order, best_duration
+
+
+def solve_optimal(start_pos, gates_pos, gates_quat, **kwargs):
+    """Build the optimizer for the fastest gate order and run ``.solve()``.
+
+    Returns:
+        (result, optimizer, best_order): ``result`` is the scipy ``OptimizeResult``.
+    """
+    optimizer, best_order, _ = build_optimizer(start_pos, gates_pos, gates_quat, **kwargs)
+    return optimizer.solve(), optimizer, best_order
+
+
 if __name__ == "__main__":
     # Demo on the level0 nominal gates (replace with obs["gates_pos"]/["gates_quat"] at runtime).
     start = np.array([-1.5, 0.75, 0.01])
@@ -275,6 +405,7 @@ if __name__ == "__main__":
     grpy = np.array([[0, 0, -0.78], [0, 0, 2.35], [0, 0, 3.14], [0, 0, 0.0]])
     gquat = R.from_euler("xyz", grpy).as_quat()
 
-    # Output: only the waypoints to follow for the time-optimal path.
-    waypoints = optimal_waypoints(start, gpos, gquat)
-    print(waypoints)
+    # 1. Fastest gate order, then hand everything to the TOTG optimizer and solve.
+    result, optimizer, best_order = solve_optimal(start, gpos, gquat)
+    print(f"Best gate order: {best_order}")
+    print(f"Optimizer success: {result.success} | final cost (total time + penalty): {result.fun:.3f}")
