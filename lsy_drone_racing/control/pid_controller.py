@@ -22,7 +22,7 @@ from lsy_drone_racing.control.TOGTPOptimizer import (
     QuadrotorModel,
 )
 
-GATE_OPENING = 0.4  # m, square gate inner opening (see config/level0.toml)
+GATE_OPENING = 0.1  # m, square gate inner opening (see config/level0.toml)
 
 
 def togt_optimized_waypoints(start_pos, gates_pos, gates_quat, exit_dist=0.3, gate_use_frac=0.1):
@@ -117,19 +117,20 @@ class StateController(Controller):
         path = ta.SplineInterpolator(ss, waypoints)
 
         # 2. Define kinematic constraints for the drone
-        v_max_xy = 1
-        v_max_z = 1
+        v_max_xy = 2.2  # Assez rapide, mais évite la saturation liée à la traînée aérodynamique
+        v_max_z = 1.0   # Fluide, donne au contrôleur le temps d'anticiper l'inertie
         vbounds = np.array([
-            [-v_max_xy, v_max_xy],
-            [-v_max_xy, v_max_xy],
-            [-v_max_z, v_max_z]
+            [-v_max_xy, v_max_xy], # X
+            [-v_max_xy, v_max_xy], # Y
+            [-v_max_z, v_max_z]    # Z
         ])
         
-        a_max_xy = 1
+        # Le "Sweet spot" pour garder un bon tracking sans décrocher
+        a_max_xy = 4.5  
         abounds = np.array([
-            [-a_max_xy, a_max_xy],
-            [-a_max_xy, a_max_xy],
-            [-1, 1]
+            [-a_max_xy, a_max_xy], # X (Inclinaison max d'environ 25°, gérable pour maintenir l'altitude)
+            [-a_max_xy, a_max_xy], # Y
+            [-8.2, 5.5]            # Z (Tient compte de la baisse de tension de la batterie après 1 min de vol)
         ])
         
         pc_vel = constraint.JointVelocityConstraint(vbounds)

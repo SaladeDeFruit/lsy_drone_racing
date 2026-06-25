@@ -49,7 +49,7 @@ DEFAULT_ACC_LIMIT = np.array([[-2.0, 2.0], [-2.0, 2.0], [-1.5, 1.5]])  # m/s^2
 # HOOK: another module may set this (before the controller is instantiated) to flag risky gates
 # and the roll angle (radians) to force at each. Key = gate index in ``obs["gates_pos"]``.
 # Example: ``racing_attitude_mpc.RISKY_GATE_ROLL = {2: np.pi / 2}``.
-RISKY_GATE_ROLL: dict[int, float] = {}
+RISKY_GATE_ROLL: dict[int, float] = {0 : np.pi/2,3 : np.pi/2}
 
 # Roll-maneuver tuning (knobs).
 ROLL_WINDOW_S = 0.15  # half-width of the roll window, in seconds
@@ -200,7 +200,13 @@ class RacingAttitudeMPC(Controller):
             )
 
         # Risky-gate maneuver active? (decides the solver's roll bound / slack.)
-        self._risky_gates = dict(RISKY_GATE_ROLL)
+        # Sources, merged: module-level RISKY_GATE_ROLL (hardcoded default, editable in this
+        # file) overridden by config ``risky_gates`` (robust hook: another module / the config
+        # can set {gate_idx: roll_rad} without depending on this module's global identity, which
+        # ``load_controller`` re-creates). Keys normalized to int, values to float radians.
+        self._risky_gates = {int(k): float(v) for k, v in RISKY_GATE_ROLL.items()}
+        cfg_risky = config.get("risky_gates", {}) if hasattr(config, "get") else {}
+        self._risky_gates.update({int(k): float(v) for k, v in dict(cfg_risky).items()})
         self._has_maneuver = len(self._risky_gates) > 0
 
         self.drone_params = load_params("so_rpy", config.sim.drone_model)

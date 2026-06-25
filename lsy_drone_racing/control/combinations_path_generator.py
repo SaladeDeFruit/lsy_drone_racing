@@ -399,7 +399,7 @@ def solve_optimal(start_pos, gates_pos, gates_quat, **kwargs):
 
 
 if __name__ == "__main__":
-    # Demo on the level0 nominal gate   s (replace with obs["gates_pos"]/["gates_quat"] at runtime).
+    # Demo on the level0 nominal gates (replace with obs["gates_pos"]/["gates_quat"] at runtime).
     start = np.array([-1.5, 0.75, 0.01])
     gpos = np.array([[0.5, 0.25, 0.7], [1.05, 0.75, 1.2], [-1.0, -0.25, 0.7], [0.0, -0.75, 1.2]])
     grpy = np.array([[0, 0, -0.78], [0, 0, 2.35], [0, 0, 3.14], [0, 0, 0.0]])
