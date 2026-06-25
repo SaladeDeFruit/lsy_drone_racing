@@ -190,8 +190,8 @@ class StateController(Controller):
         des_vel = self._trajectory(t, 1)
         des_acc = self._trajectory(t, 2)
 
-        yaw_and_rates = np.zeros(3) 
-        action = np.concatenate((des_pos, des_vel, des_acc), dtype=np.float32)
+        yaw_and_rates = np.zeros(4) 
+        action = np.concatenate((des_pos, des_vel, des_acc,(0,0.1,0,0)), dtype=np.float32)
         
         return action
 

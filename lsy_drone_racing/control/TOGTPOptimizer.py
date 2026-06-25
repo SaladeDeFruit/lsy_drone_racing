@@ -3,24 +3,51 @@ from scipy.optimize import minimize
 from scipy.interpolate import make_interp_spline
 import matplotlib.pyplot as plt
 
+DRONE_RADIUS = 0.15
+
 class QuadrotorModel:
     def __init__(self):
-        # cf2x_P250 (the only two used by the current cost are mass and f_max).
-        self.mass = 0.0318                                    # kg
-        self.f_max = 0.12                                     # N per motor (thrust_max)
+        self.mass = 0.85
+        self.arm_length = 0.15
+        self.drone_radius = self.arm_length + 0.08  # ← à ajouter
+        self.inertia = np.array([1.0, 1.0, 1.7]) * 1e-3
+        self.f_max = 6.88
+        self.c_tau = 0.05
+        self.omega_max = np.array([15.0, 15.0, 3.0])
         self.gravity = np.array([0, 0, -9.81])
-        # Set for correctness / future use (not used by the current cost function):
-        self.arm_length = 0.046                               # m (cf2x approx)
-        self.inertia = np.array([16.8e-6, 16.8e-6, 29.8e-6])  # kg m^2 (J diag)
-        self.c_tau = 0.0069928948992470565                    # thrust2torque
-        self.omega_max = np.array([15.0, 15.0, 3.0])          # rad/s (kept; tune if needed)
 
 class PolygonGate:
-    def __init__(self, id, vertices):
+    def __init__(self, id, vertices, margin=0.15): 
         self.id = id
         self.center = np.mean(vertices, axis=0)
-        self.vertices = np.array(vertices).T
+        
+        # --- 1. Ajout de la marge de sécurité (Shrinking) ---
+        safe_vertices = []
+        for v in vertices:
+            vector_to_center = self.center - v
+            dist = np.linalg.norm(vector_to_center)
+            shrink_ratio = max(0, dist - margin) / dist 
+            safe_vertices.append(self.center - vector_to_center * shrink_ratio)
+            
+        self.vertices = np.array(safe_vertices).T
         self.v = self.vertices.shape[1]       
+        
+        # --- 2. Calcul des axes de la porte en 3D ---
+        # On prend 3 points pour calculer le vecteur normal (perpendiculaire à la porte)
+        v0, v1, v2 = self.vertices[:, 0], self.vertices[:, 1], self.vertices[:, 2]
+        self.normal = np.cross(v1 - v0, v2 - v1)
+        self.normal = self.normal / (np.linalg.norm(self.normal) + 1e-9)
+        
+        # L'axe horizontal est perpendiculaire à la normale ET à l'axe Z mondial (la gravité)
+        z_world = np.array([0.0, 0.0, 1.0])
+        self.horizontal_axis = np.cross(z_world, self.normal)
+        
+        # Normalisation (avec sécurité si la porte est posée à plat au sol, type "dive")
+        norm_h = np.linalg.norm(self.horizontal_axis)
+        if norm_h > 1e-6:
+            self.horizontal_axis = self.horizontal_axis / norm_h
+        else:
+            self.horizontal_axis = np.array([1.0, 0.0, 0.0])
     
     def smooth_surjection(self, d):
         d_squared = np.square(d) 
@@ -64,21 +91,72 @@ class DroneRacingOptimizer:
         return np.exp(K)
     
     def cost_function(self, variables):
-        split_idx = self.num_gates * 4 
+        split_idx = self.num_gates * 4
         D_vars = variables[:split_idx].reshape((self.num_gates, 4))
         K_vars = variables[split_idx:]
-        
+
         T_segments = self.transform_time(K_vars)
         total_time = np.sum(T_segments)
-        
+
         waypoints = [self.start_pos]
         for i, gate in enumerate(self.gates):
             waypoints.append(gate.smooth_surjection(D_vars[i]))
         waypoints.append(self.end_pos)
 
         penalty = self.evaluate_trajectory_constraints(waypoints, T_segments)
-        return total_time + penalty
+        gate_penalty = self._gate_frame_collision_penalty(waypoints, T_segments)
+
+        return total_time + penalty + gate_penalty
     
+    def _gate_frame_collision_penalty(self, waypoints, times):
+        penalty = 0.0
+        try:
+            traj = SplineTrajectory(waypoints, times)
+        except ValueError:
+            return 500.0
+
+        t_candidates = np.linspace(traj.t_points[0], traj.t_points[-1], 500)
+
+        for gate_idx, gate in enumerate(self.gates):
+            vertical_axis = np.cross(gate.normal, gate.horizontal_axis)
+
+            h_coords = [np.dot(v - gate.center, gate.horizontal_axis) for v in gate.vertices.T]
+            v_coords = [np.dot(v - gate.center, vertical_axis) for v in gate.vertices.T]
+            half_w = max(abs(h) for h in h_coords)
+            half_h = max(abs(v) for v in v_coords)
+
+            inner_half_w = half_w - DRONE_RADIUS
+            inner_half_h = half_h - DRONE_RADIUS
+
+            # Trouver le croisement du plan de cette porte
+            signed_dists = np.array([
+                np.dot(traj.get_state_at(t)[0] - gate.center, gate.normal)
+                for t in t_candidates
+            ])
+            sign_changes = np.where(np.diff(np.sign(signed_dists)))[0]
+
+            if len(sign_changes) == 0:
+                penalty += 200.0
+                continue
+
+            # Point de croisement exact
+            idx = sign_changes[0]
+            t_cross = (t_candidates[idx] + t_candidates[idx + 1]) / 2.0
+            crossing_point, _, _ = traj.get_state_at(t_cross)
+
+            diff = crossing_point - gate.center
+            h_proj = np.dot(diff, gate.horizontal_axis)
+            v_proj = np.dot(diff, vertical_axis)
+
+            # Trop à droite/gauche ou trop haut/bas → touche le cadre
+            h_overshoot = max(0.0, abs(h_proj) - inner_half_w)
+            v_overshoot = max(0.0, abs(v_proj) - inner_half_h)
+            penetration = max(h_overshoot, v_overshoot)
+            if penetration > 0:
+                penalty += penetration ** 2 * 200.0
+
+        return penalty
+        
     def evaluate_trajectory_constraints(self, waypoints, times):
         penalty = 0.0
         
