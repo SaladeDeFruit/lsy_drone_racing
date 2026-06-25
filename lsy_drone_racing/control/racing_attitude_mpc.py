@@ -43,19 +43,19 @@ ROLL_IDX, PITCH_IDX, YAW_IDX = 3, 4, 5
 # Per-axis TOPP-RA kinematic limits for the reference. Format (dof, 2) = [lower, upper].
 # Kept moderate so the attitude MPC tracks the reference smoothly (an over-aggressive,
 # time-optimal reference makes the MPC saturate thrust and chatter the roll command).
-DEFAULT_VEL_LIMIT = np.array([[-1.2, 1.2], [-1.2, 1.2], [-0.8, 0.8]])  # m/s
-DEFAULT_ACC_LIMIT = np.array([[-2.0, 2.0], [-2.0, 2.0], [-1.5, 1.5]])  # m/s^2
+DEFAULT_VEL_LIMIT = np.array([[-1.5, 1.5], [-1.5, 1.5], [-0.8, 0.8]])  # m/s
+DEFAULT_ACC_LIMIT = np.array([[-2.5, 2.5], [-2.5, 2.5], [-4, 3]])  # m/s^2
 
 # HOOK: another module may set this (before the controller is instantiated) to flag risky gates
 # and the roll angle (radians) to force at each. Key = gate index in ``obs["gates_pos"]``.
 # Example: ``racing_attitude_mpc.RISKY_GATE_ROLL = {2: np.pi / 2}``.
-RISKY_GATE_ROLL: dict[int, float] = {0 : np.pi/2,3 : np.pi/2}
+RISKY_GATE_ROLL: dict[int, float] = {}
 
 # Roll-maneuver tuning (knobs).
 ROLL_WINDOW_S = 0.15  # half-width of the roll window, in seconds
 ROLL_WEIGHT_WINDOW = 200.0  # roll state weight inside the window (base is 1.0)
 POS_WEIGHT_WINDOW = np.array([10.0, 10.0, 5.0])  # reduced pos weight (esp. z) inside the window
-
+ 
 
 def create_acados_model(parameters: dict) -> AcadosModel:
     """Creates an acados model from the symbolic so_rpy drone model (attitude inputs)."""
@@ -84,12 +84,12 @@ def base_cost_weights() -> tuple[NDArray, NDArray]:
     Q = np.diag(
         [
             50.0, 50.0, 400.0,  # pos
-            1.0, 1.0, 0.0,  # rpy: roll, pitch tracked; yaw FREE (weight 0)
+            0, 0, 0.0,  # rpy: roll, pitch tracked; yaw FREE (weight 0)
             10.0, 10.0, 10.0,  # vel
             5.0, 5.0, 2.0,  # drpy
         ]
     )
-    R_in = np.diag([1.0, 1.0, 1.0, 50.0])  # roll/pitch/yaw commands + thrust
+    R_in = np.diag([0.5, 0.5, 0.5, 50.0])  # roll/pitch/yaw commands + thrust
     return Q, R_in
 
 
@@ -244,7 +244,7 @@ class RacingAttitudeMPC(Controller):
         import toppra.algorithm as toppra_algo
         import toppra.constraint as toppra_constraint
 
-        waypoints = togt_optimized_waypoints(obs["pos"], obs["gates_pos"], obs["gates_quat"])
+        waypoints = togt_optimized_waypoints(obs["pos"], obs["gates_pos"], obs["gates_quat"], exit_dist=0.3, gate_use_frac=0.1)
         ss = chord_length_param(waypoints)
         path = ta.SplineInterpolator(ss, waypoints)
 

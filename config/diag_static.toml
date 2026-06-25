@@ -1,8 +1,8 @@
-# Level 2
+# Level 3
 
-# | Evaluation Scenario | Randomized Inertial Properties | Randomized Obstacles, Gates | Randomized Tracks | Notes                 |
-# | :-----------------: | :----------------------------: | :-------------------------: | :---------------: | :-------------------: |
-# | `level2.toml`       | *Yes*                          | *Yes*                       | *No*              | Learning, re-planning |
+# | Evaluation Scenario | Randomized Inertial Properties | Randomized Obstacles, Gates | Randomized Tracks | Notes           |
+# | :-----------------: | :----------------------------: | :-------------------------: | :---------------: | :-------------: |
+# | `level3.toml`       | *Yes*                          | *Yes*                       | *Yes*             | Online planning |
 [controller]
 file = "mpcc_controller.py" # Put your controller file name here. Specifying a controller as argument to scripts will override this setting. Controllers are located in `lsy_drone_racing/control/`
 

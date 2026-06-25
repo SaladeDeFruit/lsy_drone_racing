@@ -1,14 +1,18 @@
 from __future__ import annotations
 
-import os    # <-- NOUVEAU IMPORT POUR LE CHEMIN DU FICHIER
-import time  # <-- IMPORT AJOUTÉ POUR LE CHRONOMÈTRE
+import os
+import time
 from typing import TYPE_CHECKING
 
 import numpy as np
 import toppra as ta
 import toppra.constraint as constraint
 import toppra.algorithm as algo
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
 from crazyflow.sim.visualize import draw_line, draw_points
+from scipy.interpolate import make_interp_spline
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
@@ -22,46 +26,76 @@ from lsy_drone_racing.control.TOGTPOptimizer import (
     QuadrotorModel,
 )
 
-GATE_OPENING = 0.1  # m, square gate inner opening (see config/level0.toml)
+GATE_OPENING = 0.4
+lookat = [0.0, 0.0, 0.0]
+  # m, square gate inner opening
+SHOW_MATPLOTLIB_DEBUG = False  # METTRE À FALSE POUR NE PAS BLOQUER LA SIMULATION
+
+# Le drone se stabilise quelques cm AU-DESSUS de la consigne (erreur de suivi statique en z).
+# On commande donc une altitude un peu plus basse pour compenser. Augmenter si le drone reste
+# trop haut, diminuer s'il vole trop bas.
+Z_OFFSET = 0.05  # m, abaissement de la consigne d'altitude
 
 
-def togt_optimized_waypoints(start_pos, gates_pos, gates_quat, exit_dist=0.3, gate_use_frac=0.1):
-    """Run the TOGT optimizer (DroneRacingOptimizer) and return its end-of-pipeline waypoints.
+def plot_debug_3d(gates_verts, waypoints, start_pos, end_pos):
+    """Affiche la trajectoire finale et les portes dans Matplotlib."""
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
 
-    The gates are first reordered into the SEQUENCE chosen by ``combinations_path_generator``
-    (the fastest gate order by TOPP-RA ranking), then handed to the optimizer in that sequence.
-    The optimizer optimizes, per gate, WHERE inside the gate opening the path crosses, plus the
-    per-segment times, minimizing total time under a motor-thrust penalty. We then rebuild the
-    geometric waypoints from its solution:
-    ``[start, crossing_gate_0, ..., crossing_gate_n, end]``. These feed TOPP-RA downstream.
+    # Tracer les portes (vert)
+    for verts in gates_verts:
+        ax.add_collection3d(Poly3DCollection([verts], alpha=0.15, facecolor='green', edgecolor='black'))
 
-    Args:
-        start_pos: (3,) drone start position (``obs["pos"]``).
-        gates_pos: (n_gates, 3) gate centers (``obs["gates_pos"]``).
-        gates_quat: (n_gates, 4) xyzw gate orientations (``obs["gates_quat"]``).
-        exit_dist: how far past the last gate (along its normal) to place the end point, in meters.
-        gate_use_frac: fraction of the half-opening the crossing may use. The optimizer pushes the
-            crossing to a polygon CORNER (worst case in-plane offset = half * sqrt(2)); shrinking
-            the polygon keeps that corner safely inside the real opening (and clear of the frame).
+    # Tracer la trajectoire optimisée
+    ax.plot(waypoints[:, 0], waypoints[:, 1], waypoints[:, 2], 'b.-', linewidth=2, label='Trajectoire TOGT')
+    ax.scatter(*start_pos, color='k', s=50, label='Départ')
+    ax.scatter(*end_pos, color='m', s=50, label='Arrivée')
 
-    Returns:
-        (n_gates + 2, 3) array of waypoints in traversal order.
-    """
+    # Configuration de la vue
+    all_pts = np.vstack([waypoints, start_pos, end_pos])
+    ax.set_xlim([all_pts[:, 0].min()-1, all_pts[:, 0].max()+1])
+    ax.set_ylim([all_pts[:, 1].min()-1, all_pts[:, 1].max()+1])
+    ax.set_zlim([all_pts[:, 2].min()-1, all_pts[:, 2].max()+1])
+    ax.set_title("Optimisation TOGT")
+    ax.legend()
+    plt.show()
+
+
+def add_lead_in_out(waypoints, gates_quat, lead=0.35):
+    out = [waypoints[0]]
+    prev = waypoints[0]
+    for i in range(len(gates_quat)):
+        apex = waypoints[1 + i]
+        n = R.from_quat(gates_quat[i]).apply([1.0, 0.0, 0.0])
+        if np.dot(n, apex - prev) < 0:
+            n = -n
+        out.append(apex - lead * n)
+        out.append(apex)
+        out.append(apex + lead * n)
+        prev = apex
+    out.append(waypoints[-1])
+    return np.array(out)
+
+
+def togt_optimized_waypoints(start_pos, gates_pos, gates_quat, exit_dist=0.3, gate_use_frac=0.9,
+                             reorder=True, return_order=False):
     gates_pos = np.asarray(gates_pos, dtype=float)
     gates_quat = np.asarray(gates_quat, dtype=float)
     start_pos = np.asarray(start_pos, dtype=float)
 
-    # Reorder the gates into the sequence given by combinations_path_generator (fastest order by
-    # TOPP-RA ranking), so the TOGT optimizer receives the gates in that traversal order.
-    order = rank_combinations_by_duration(start_pos, gates_pos, gates_quat)[0][0]
-    order = list(order)
+    # Réorganisation des portes par durée (ordre TOGT le plus rapide). À désactiver
+    # (reorder=False) quand la course impose l'ordre des indices (cf. obs["target_gate"]).
+    if reorder:
+        order = list(rank_combinations_by_duration(start_pos, gates_pos, gates_quat)[0][0])
+    else:
+        order = list(range(len(gates_pos)))
     gates_pos = gates_pos[order]
     gates_quat = gates_quat[order]
 
-    half = (GATE_OPENING / 2.0) * gate_use_frac  # safety margin: corner stays inside the opening
+    half = (GATE_OPENING / 2.0) * gate_use_frac
 
-    # Build a PolygonGate (4 corners of the opening) per gate, in the gate plane (y, z axes).
-    gates = []
+    # Extraire les coins des portes
+    gates_verts = []
     for g in range(len(gates_pos)):
         rot = R.from_quat(gates_quat[g])
         y_axis, z_axis = rot.apply([0.0, 1.0, 0.0]), rot.apply([0.0, 0.0, 1.0])
@@ -72,128 +106,236 @@ def togt_optimized_waypoints(start_pos, gates_pos, gates_quat, exit_dist=0.3, ga
             c - half * y_axis - half * z_axis,
             c + half * y_axis - half * z_axis,
         ]
+        gates_verts.append(verts)
+
+    # Création des objets PolygonGate pour le TOGT
+    gates = []
+    for g, verts in enumerate(gates_verts):
         gates.append(PolygonGate(g, verts))
 
-    # End point: just past the last gate, on the side the drone is travelling toward.
+    # Point de fin
     last_normal = R.from_quat(gates_quat[-1]).apply([1.0, 0.0, 0.0])
     incoming = gates_pos[-1] - (gates_pos[-2] if len(gates_pos) > 1 else start_pos)
     sign = 1.0 if np.dot(incoming, last_normal) >= 0 else -1.0
     end_pos = gates_pos[-1] + sign * exit_dist * last_normal
 
-    result = DroneRacingOptimizer(QuadrotorModel(), gates, start_pos, end_pos).solve()
-    d_vars = result.x[: len(gates) * 4].reshape((len(gates), 4))
+    # Résolution TOGT
+    inst = DroneRacingOptimizer(QuadrotorModel(), gates, start_pos, end_pos)
+    result = inst.solve()
 
-    waypoints = [start_pos]
-    for i, gate in enumerate(gates):
-        waypoints.append(gate.smooth_surjection(d_vars[i]))
-    waypoints.append(end_pos)
-    return np.array(waypoints)
+    # Reconstruire les waypoints géométriques
+    d_vars = result.x[: len(gates) * 4].reshape((len(gates), 4))
+    k_vars = result.x[len(gates) * 4:]
+    t_segments = inst.transform_time(k_vars)
+    waypoints, _ = inst._build_waypoints(d_vars, t_segments)
+    waypoints_array = np.array(waypoints)
+    waypoints_array = add_lead_in_out(waypoints_array, gates_quat, lead=0.02)
+
+    if SHOW_MATPLOTLIB_DEBUG:
+        plot_debug_3d(gates_verts, waypoints_array, start_pos, end_pos)
+
+    if return_order:
+        return waypoints_array, order
+    return waypoints_array
+
 
 if TYPE_CHECKING:
     from crazyflow import Sim
     from numpy.typing import NDArray
 
 
+class QuinticTrajectory:
+    """Trajectoire spline quintique (degré 5), avec la même interface que la trajectoire
+    TOPP-RA : ``traj(t, order)`` (order 0/1/2 = pos/vit/acc) et ``.duration``.
+
+    Construite pour imposer exactement (position, vitesse, accélération) au départ — le point
+    recalculé — donc continuité C2 : aucune discontinuité de vitesse/accélération lors d'une
+    re-planification en vol.
+    """
+
+    def __init__(self, spline, duration):
+        self._spline = spline
+        self._d1 = spline.derivative(1)
+        self._d2 = spline.derivative(2)
+        self.duration = float(duration)
+
+    def __call__(self, t, order: int = 0):
+        t = float(np.clip(t, 0.0, self.duration))
+        if order == 0:
+            return np.asarray(self._spline(t), dtype=float)
+        if order == 1:
+            return np.asarray(self._d1(t), dtype=float)
+        return np.asarray(self._d2(t), dtype=float)
+
+
 class StateController(Controller):
     """State controller following a pre-defined TOPP-RA trajectory."""
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
-        """Initialization of the controller."""
         super().__init__(obs, info, config)
         self._freq = config.env.freq
 
-        # Suppress verbose TOPP-RA logging (optional)
         ta.setup_logging("WARNING")
-        start_pos = obs["pos"]
-        # Récupérer la trajectoire optimisée en fin de pipeline par le TOGT optimizer
-        # (DroneRacingOptimizer) : gates dans l'ordre de la course, point de passage optimal
-        # dans chaque porte + temps optimaux. On en extrait les waypoints géométriques.
-        waypoints = togt_optimized_waypoints(start_pos, obs["gates_pos"], obs["gates_quat"])
+        start_pos = np.asarray(obs["pos"], dtype=float)
 
-        # 1. Create a geometric path from the waypoints. Use distance-proportional knots
-        # (chord length), NOT np.linspace: with uniform knots the cubic spline overshoots and
-        # loops at each gate (the close approach/center/exit triplet vs the ~1 m gate jumps).
-        ss = chord_length_param(waypoints)
-        path = ta.SplineInterpolator(ss, waypoints)
-
-        # 2. Define kinematic constraints for the drone
-        v_max_xy = 2.2  # Assez rapide, mais évite la saturation liée à la traînée aérodynamique
-        v_max_z = 1.0   # Fluide, donne au contrôleur le temps d'anticiper l'inertie
-        vbounds = np.array([
-            [-v_max_xy, v_max_xy], # X
-            [-v_max_xy, v_max_xy], # Y
-            [-v_max_z, v_max_z]    # Z
+        # Bornes cinématiques pour TOPP-RA, réutilisées à chaque (re-)planification.
+        v_max_xy = 1
+        v_max_z = 1
+        self._vbounds = np.array([
+            [-v_max_xy, v_max_xy],
+            [-v_max_xy, v_max_xy],
+            [-v_max_z, v_max_z]
         ])
-        
-        # Le "Sweet spot" pour garder un bon tracking sans décrocher
-        a_max_xy = 4.5  
-        abounds = np.array([
-            [-a_max_xy, a_max_xy], # X (Inclinaison max d'environ 25°, gérable pour maintenir l'altitude)
-            [-a_max_xy, a_max_xy], # Y
-            [-8.2, 5.5]            # Z (Tient compte de la baisse de tension de la batterie après 1 min de vol)
+        a_max_xy = 1
+        self._abounds = np.array([
+            [-a_max_xy, a_max_xy],
+            [-a_max_xy, a_max_xy],
+            [-1, 1]
         ])
-        
-        pc_vel = constraint.JointVelocityConstraint(vbounds)
-        pc_acc = constraint.JointAccelerationConstraint(abounds)
-
-        # 3. Setup and solve the TOPP-RA problem
-        instance = algo.TOPPRA([pc_vel, pc_acc], path, parametrizer="ParametrizeConstAccel")
-        self._trajectory = instance.compute_trajectory()
-
-        if self._trajectory is None:
-            raise RuntimeError("TOPP-RA failed to compute a valid trajectory. Check your waypoints and constraints.")
-
-        self._t_total = self._trajectory.duration
-        print(f"Computed TOPP-RA trajectory with optimal duration: {self._t_total:.2f} s")
 
         self._tick = 0
         self._finished = False
-        
-        # --- VARIABLES POUR LE TEMPS RÉEL ---
         self._real_start_time = None
         self._time_logged = False
-        
-        # --- NOUVEAU : PRÉPARATION DU FICHIER ET PREMIÈRE ÉCRITURE ---
-        # On définit le chemin absolu vers le dossier actuel
+
+        # On garde l'ordre TOGT (le plus rapide) pour voler. self._order[j] = indice config de
+        # la j-ème porte balayée ; self._waypoints_full est donc dans cet ordre de traversée.
+        self._waypoints_full, self._order = togt_optimized_waypoints(
+            start_pos, obs["gates_pos"], obs["gates_quat"], return_order=True
+        )
+
+        # Indice (dans l'ordre de balayage) de la prochaine porte à corriger dès qu'elle se révèle.
+        self._next_j = 0
+
+        # Trajectoire initiale : on suit le plan nominal jusqu'à la première découverte.
+        self._build_trajectory(self._waypoints_full)
+
         current_dir = os.path.dirname(os.path.abspath(__file__))
         self._log_file = os.path.join(current_dir, "temps_reel_trajet.txt")
-        
-        # On écrit la première partie de la ligne (SANS retour à la ligne '\n')
+
         with open(self._log_file, "a", encoding="utf-8") as f:
             f.write(f"Temps simulé: {self._t_total:.4f} s | Temps réel: ")
+
+    def _build_trajectory(self, waypoints):
+        """Construit (ou reconstruit) la trajectoire TOPP-RA à partir d'une liste de waypoints.
+
+        cubic spline d'interpolation (``ta.SplineInterpolator``) + re-temporisation TOPP-RA.
+        Remet l'horloge à zéro : la nouvelle trajectoire repart de son ``t = 0`` (premier
+        waypoint). Appelée au démarrage (plan nominal) puis à chaque découverte d'une porte.
+        """
+        waypoints = np.asarray(waypoints, dtype=float)
+        self._waypoints = waypoints
+
+        ss = chord_length_param(waypoints)
+        path = ta.SplineInterpolator(ss, waypoints)
+
+        pc_vel = constraint.JointVelocityConstraint(self._vbounds)
+        pc_acc = constraint.JointAccelerationConstraint(self._abounds)
+        instance = algo.TOPPRA([pc_vel, pc_acc], path, parametrizer="ParametrizeConstAccel")
+        trajectory = instance.compute_trajectory()
+
+        if trajectory is None:
+            raise RuntimeError("TOPP-RA failed to compute a valid trajectory. Check your waypoints and constraints.")
+
+        self._trajectory = trajectory
+        self._t_total = trajectory.duration
+        self._tick = 0  # la nouvelle trajectoire repart de son début
+        print(f"[plan] trajectoire (re)calculée : {len(waypoints)} waypoints, durée {self._t_total:.2f} s")
+
+    def _build_corrected_trajectory(self, waypoints, v0, a0, n_samples: int = 60):
+        """Re-planification CONTINUE (C2) : injecte l'état courant (v0, a0) au point recalculé.
+
+        1) TOPP-RA fournit le timing time-optimal et respecte les contraintes sur la géométrie
+           (cubic spline d'interpolation des waypoints).
+        2) On ré-ajuste une spline QUINTIQUE (ordre 5) sur des échantillons temporels de cette
+           trajectoire, en imposant au départ (vitesse = v0, accélération = a0) et en fin les
+           (vitesse, accélération) de TOPP-RA (≈ arrêt). Résultat : profil quasi time-optimal
+           mais sans à-coup de vitesse/accélération au moment de la re-planification.
+        """
+        waypoints = np.asarray(waypoints, dtype=float)
+        self._waypoints = waypoints
+
+        ss = chord_length_param(waypoints)
+        path = ta.SplineInterpolator(ss, waypoints)
+        pc_vel = constraint.JointVelocityConstraint(self._vbounds)
+        pc_acc = constraint.JointAccelerationConstraint(self._abounds)
+        toppra_traj = algo.TOPPRA(
+            [pc_vel, pc_acc], path, parametrizer="ParametrizeConstAccel"
+        ).compute_trajectory()
+        if toppra_traj is None:
+            raise RuntimeError("TOPP-RA a échoué pendant la re-planification corrigée.")
+
+        T = float(toppra_traj.duration)
+        ts = np.linspace(0.0, T, n_samples)
+        pos = np.array([toppra_traj(t, 0) for t in ts])          # (n_samples, 3)
+        v_end = np.asarray(toppra_traj(T, 1), dtype=float)
+        a_end = np.asarray(toppra_traj(T, 2), dtype=float)
+
+        # bc_type ordre 5 : 2 conditions à chaque bord (1re et 2e dérivées).
+        bc = (
+            [(1, np.asarray(v0, dtype=float)), (2, np.asarray(a0, dtype=float))],
+            [(1, v_end), (2, a_end)],
+        )
+        quintic = make_interp_spline(ts, pos, k=5, bc_type=bc)
+
+        self._trajectory = QuinticTrajectory(quintic, T)
+        self._t_total = T
+        self._tick = 0
+        print(f"[plan] correction quintique (ordre 5) : durée {T:.2f} s, v0={np.round(v0, 2)}")
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
-        """Compute the next desired state of the drone."""
-        
-        # --- DÉMARRER LE CHRONO AU PREMIER MOUVEMENT ---
+
+        # --- Correction locale : on corrige chaque porte dès qu'elle se révèle, DANS L'ORDRE
+        # où le drone les balaie (ordre TOGT). self._order[self._next_j] = indice config de la
+        # prochaine porte balayée ; on attend que sa vraie position soit révélée (gates_visited).
+        visited = np.asarray(obs["gates_visited"]).reshape(-1)
+        if self._next_j < len(self._order) and visited[self._order[self._next_j]]:
+            j = self._next_j
+            g = self._order[j]                                              # porte balayée (indice config)
+            self._next_j += 1
+            discovery_pos = np.asarray(obs["pos"], dtype=float)
+            true_center = np.asarray(obs["gates_pos"], dtype=float)[g]       # vraie position révélée
+            # Rejoint le nominal LE PLUS TÔT possible : après le vrai centre, on reprend la
+            # trajectoire nominale dès l'apex de la porte (indice 2 + 3*j) au lieu d'attendre le
+            # lead-out (3 + 3*j). La partie adaptée se limite à [position courante -> vrai centre].
+            rejoin = self._waypoints_full[2 + 3 * j:]                        # apex_j, lead_out_j, ... -> fin
+            new_wps = np.vstack([discovery_pos, true_center, rejoin])
+
+            # État courant injecté pour une re-planification continue (C2, sans à-coup) :
+            # v0 = vitesse réelle mesurée, a0 = accélération qu'on commandait juste avant.
+            t_now = min(self._tick / self._freq, self._t_total)
+            v0 = np.asarray(obs["vel"], dtype=float)
+            a0 = np.asarray(self._trajectory(t_now, 2), dtype=float)
+            try:
+                self._build_corrected_trajectory(new_wps, v0, a0)
+            except Exception as e:  # robustesse : repli sur un plan depuis l'arrêt
+                print(f"[plan] correction quintique échouée ({e!r}) ; repli TOPP-RA depuis l'arrêt.")
+                self._build_trajectory(new_wps)
+
         if self._real_start_time is None:
             self._real_start_time = time.perf_counter()
 
         t = min(self._tick / self._freq, self._t_total)
-        
-        # --- VÉRIFIER LA FIN ET COMPLÉTER LE FICHIER ---
-        if t >= self._t_total and not self._finished: 
+
+        if t >= self._t_total and not self._finished:
             self._finished = True
-            
+
             if not self._time_logged:
-                # Calcul de la durée d'exécution réelle
                 real_duration = time.perf_counter() - self._real_start_time
-                
-                # On complète la ligne existante et on ajoute le retour à la ligne (\n) à la fin
                 with open(self._log_file, "a", encoding="utf-8") as f:
                     f.write(f"{real_duration:.4f} s\n")
-                
                 self._time_logged = True
 
-        des_pos = self._trajectory(t, 0)
+        des_pos = self._trajectory(t, 0).copy()
+        des_pos[2] -= Z_OFFSET  # abaisse la consigne d'altitude pour compenser le suivi statique en z
         des_vel = self._trajectory(t, 1)
         des_acc = self._trajectory(t, 2)
 
-        yaw_and_rates = np.zeros(4) 
-        action = np.concatenate((des_pos, des_vel, des_acc,(0,0.1,0,0)), dtype=np.float32)
-        
+        yaw_and_rates = np.zeros(4)
+        action = np.concatenate((des_pos, des_vel, des_acc, (0, 0.1, 0, 0)), dtype=np.float32)
+
         return action
 
     def step_callback(
@@ -205,33 +347,33 @@ class StateController(Controller):
         truncated: bool,
         info: dict,
     ) -> bool:
-        """Increment the time step counter."""
         self._tick += 1
         return self._finished
 
     def episode_callback(self):
-        """Reset the internal state."""
-        # --- SÉCURITÉ : Si l'épisode précédent a été coupé avant d'atteindre la fin ---
         if self._real_start_time is not None and not self._time_logged:
-             with open(self._log_file, "a", encoding="utf-8") as f:
-                 f.write("Inachevé (Crash ou Reset)\n")
+            with open(self._log_file, "a", encoding="utf-8") as f:
+                f.write("Inachevé (Crash ou Reset)\n")
 
         self._tick = 0
         self._real_start_time = None
         self._time_logged = False
         self._finished = False
 
-        # --- NOUVEAU : On réécrit le début de la ligne pour le nouvel épisode ---
+        # Restaure le plan nominal complet pour le nouvel épisode (les corrections locales
+        # seront ré-appliquées au fil des découvertes).
+        self._next_j = 0
+        self._build_trajectory(self._waypoints_full)
+
         with open(self._log_file, "a", encoding="utf-8") as f:
             f.write(f"Temps simulé: {self._t_total:.4f} s | Temps réel: ")
 
     def render_callback(self, sim: Sim):
-        """Visualize the desired trajectory and the current setpoint."""
         current_time = min(self._tick / self._freq, self._t_total)
-        
+
         setpoint = self._trajectory(current_time, 0).reshape(1, -1)
         draw_points(sim, setpoint, rgba=(1.0, 0.0, 0.0, 1.0), size=0.02)
-        
+
         t_samples = np.linspace(0, self._t_total, 100)
         trajectory_points = np.array([self._trajectory(t, 0) for t in t_samples])
         draw_line(sim, trajectory_points, rgba=(0.0, 1.0, 0.0, 1.0))
