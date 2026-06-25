@@ -11,6 +11,10 @@ import toppra.algorithm as algo
 from crazyflow.sim.visualize import draw_line, draw_points
 
 from lsy_drone_racing.control import Controller
+from lsy_drone_racing.control.combinations_path_generator import (
+    chord_length_param,
+    optimal_waypoints,
+)
 
 if TYPE_CHECKING:
     from crazyflow import Sim
@@ -28,39 +32,31 @@ class StateController(Controller):
         # Suppress verbose TOPP-RA logging (optional)
         ta.setup_logging("WARNING")
         start_pos = obs["pos"]
-        waypoints = np.array(
-            [
-                start_pos,
-                [-1.0, 0.75, 0.4],
-                [0.3, 0.35, 0.7],
-                [1.3, -0.15, 0.9],
-                [0.85, 0.85, 1.2],
-                [-0.5, -0.05, 0.7],
-                [-1.2, -0.2, 0.8],
-                [-1.2, -0.2, 1.2],
-                [-0.0, -0.7, 1.2],
-                [0.5, -0.75, 1.2],
-            ]
-        )
+        # Demander au générateur de combinaisons les waypoints du chemin le plus rapide :
+        # il classe tous les (ordre de gates x faces) par durée TOPP-RA et renvoie les
+        # waypoints (start + approche/centre/sortie par gate) de la combinaison optimale.
+        waypoints = optimal_waypoints(start_pos, obs["gates_pos"], obs["gates_quat"])
 
-        # 1. Create a geometric path from the waypoints
-        ss = np.linspace(0, 1, len(waypoints))
+        # 1. Create a geometric path from the waypoints. Use distance-proportional knots
+        # (chord length), NOT np.linspace: with uniform knots the cubic spline overshoots and
+        # loops at each gate (the close approach/center/exit triplet vs the ~1 m gate jumps).
+        ss = chord_length_param(waypoints)
         path = ta.SplineInterpolator(ss, waypoints)
 
         # 2. Define kinematic constraints for the drone
         v_max_xy = 1.8
-        v_max_z = 1.0
+        v_max_z = 1
         vbounds = np.array([
             [-v_max_xy, v_max_xy],
             [-v_max_xy, v_max_xy],
             [-v_max_z, v_max_z]
         ])
         
-        a_max_xy = 4.5 
+        a_max_xy = 2.5
         abounds = np.array([
             [-a_max_xy, a_max_xy],
             [-a_max_xy, a_max_xy],
-            [-8.2, 4.5]
+            [-5, 3]
         ])
         
         pc_vel = constraint.JointVelocityConstraint(vbounds)
